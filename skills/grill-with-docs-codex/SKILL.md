@@ -8,7 +8,7 @@ description: Two-act plan hardening with living documentation. ACT 1 (you ↔ Cl
 Two acts. Act 1 aligns intent *and* keeps your living docs honest; Act 2 has a different model attack the result.
 
 - **Act 1** is Matt Pocock's `grill-with-docs`, used under MIT (see `THIRD-PARTY-NOTICES.md`). It interrogates you, challenges your plan against `CONTEXT.md`/ADRs, and updates them inline.
-- **Act 2** is the original Codex adversarial review loop — cross-model, read-only, bounded.
+- **Act 2** is the adversarial review loop — a local ollama model, cross-model, read-only (prompt-only), bounded.
 
 You enter at two points: answering the grill, and signing off the converged plan.
 
@@ -132,14 +132,13 @@ Act 1 (grill-with-docs) complete — plan locked, CONTEXT.md/ADRs updated. MAX_R
 
 ---
 
-## ACT 2 — REVIEW (Claude ↔ Codex)
-
-Hand the locked plan to Codex for adversarial review. Mechanics verified end-to-end (2026-06-04).
+## ACT 2 — REVIEW (Claude ↔ Ollama)
 
 ### Prerequisites
-- `codex --version` ≥ 0.130 (older CLIs error on the default `gpt-5.5` model).
-- Codex authenticated (`codex login`; ChatGPT account fine). On auth/model error, surface it — don't silently retry.
-- Do NOT pin `-m` (config default is used; `gpt-5.x-codex` variants 400 on ChatGPT-account auth).
+- Ollama is running locally: `curl -s ${OLLAMA_HOST:-http://localhost:11434}/api/tags` should return JSON. Start with `ollama serve` if not.
+- Target model is pulled: `ollama list` should show `$OLLAMA_MODEL`. Pull with `ollama pull $OLLAMA_MODEL` if missing.
+- `jq` is installed: `which jq`. Install via your package manager if missing.
+- On any curl error or unexpected response, surface it — don't silently retry.
 
 ### Tunables (args, else default)
 | Var | Default | Meaning |
@@ -147,32 +146,85 @@ Hand the locked plan to Codex for adversarial review. Mechanics verified end-to-
 | `MAX_ROUNDS` | `5` | Hard cap. Loop ALWAYS terminates here. |
 | `PLAN_FILE` | `PLAN.md` | The plan from Act 1. |
 | `LOG_FILE` | `PLAN-REVIEW-LOG.md` | Append-only argument transcript. |
+| `OLLAMA_MODEL` | `gemma4:26b` | Ollama model for adversarial review. Any pulled model works. |
+| `OLLAMA_HOST` | `http://localhost:11434` | Ollama API base URL. |
 
 Invoked with e.g. `rounds=3` → use it. Echo resolved values first.
 
 ### Review prompt (each round)
-> You are an adversarial reviewer for an implementation plan. Be skeptical and specific — your job is to find what breaks, not to be agreeable. Read the plan at `PLAN.md` (and `CONTEXT.md`/ADRs for the domain language) and any repo files you need (you are read-only). Identify concrete flaws: security holes, race conditions, missing edge cases, schema conflicts, domain-language mismatches, wrong assumptions, observability gaps, simpler alternatives. For each, give a one-line fix. Do NOT modify any files. End with EXACTLY one line: `VERDICT: APPROVED` or `VERDICT: REVISE`.
 
-### Round 1 — fresh session (capture `thread_id`)
+The plan (and CONTEXT.md if it exists) is inlined in the prompt — ollama cannot browse the repo directly.
+
+### Round 1 — initialize session
+
 ```bash
-codex exec -s read-only --json -o /tmp/codex-verdict.txt "$(cat REVIEW_PROMPT)" \
-  2>/dev/null | grep '"type":"thread.started"'
+OLLAMA_HOST="${OLLAMA_HOST:-http://localhost:11434}"
+OLLAMA_MODEL="${OLLAMA_MODEL:-gemma4:26b}"
+SESSION_FILE="/tmp/ollama-review-session.json"
+
+PLAN_CONTENT=$(cat "$PLAN_FILE")
+CONTEXT_SECTION=""
+[ -f CONTEXT.md ] && CONTEXT_SECTION="
+
+Domain glossary (CONTEXT.md):
+---
+$(cat CONTEXT.md)
+---"
+
+USER_MSG="You are an adversarial reviewer for an implementation plan. Be skeptical and specific — your job is to find what breaks, not to be agreeable.${CONTEXT_SECTION}
+
+Here is the plan:
+
+---
+${PLAN_CONTENT}
+---
+
+Identify concrete flaws: security holes, race conditions, missing edge cases, schema conflicts, domain-language mismatches, wrong assumptions, observability gaps, simpler alternatives. For each, give a one-line fix. End with EXACTLY one line: \`VERDICT: APPROVED\` or \`VERDICT: REVISE\`."
+
+jq -n --arg content "$USER_MSG" '[{"role":"user","content":$content}]' > "$SESSION_FILE"
+
+curl -sf "$OLLAMA_HOST/api/chat" \
+  -H 'Content-Type: application/json' \
+  -d "$(jq -n --arg model "$OLLAMA_MODEL" --argjson msgs "$(cat $SESSION_FILE)" \
+       '{model:$model,messages:$msgs,stream:false}')" \
+  | jq -r '.message.content' > /tmp/ollama-verdict.txt
+
+jq --arg reply "$(cat /tmp/ollama-verdict.txt)" \
+   '. + [{"role":"assistant","content":$reply}]' "$SESSION_FILE" > /tmp/session-tmp.json \
+  && mv /tmp/session-tmp.json "$SESSION_FILE"
 ```
-Parse `thread_id` from the `thread.started` line. Critique in `/tmp/codex-verdict.txt`. No verdict file + no `thread.started` = failed run (auth/model) → stop, tell the user. `2>/dev/null` hides cosmetic MCP/auth noise.
 
-### Rounds 2..MAX — resume SAME session
+Confirm success: `/tmp/ollama-verdict.txt` is non-empty and ends with a VERDICT line. On curl failure or missing `.message.content`, stop and tell the user.
+
+### Rounds 2..MAX — resume SAME session (prior critiques live in the messages array)
+
 ```bash
-# resume REJECTS -s. Force read-only via -c sandbox_mode, or Codex inherits
-# config.toml (possibly danger-full-access) and could WRITE files. Critical
-# safety line — verified 2026-06-04.
-codex exec resume "$THREAD_ID" -c sandbox_mode="read-only" --json \
-  -o /tmp/codex-verdict.txt \
-  "I revised the plan. Re-review PLAN.md — check prior findings + flag anything new. End with VERDICT: APPROVED or VERDICT: REVISE." \
-  2>/dev/null >/dev/null
+PLAN_CONTENT=$(cat "$PLAN_FILE")
+FOLLOW_UP="I revised the plan. Here it is again:
+
+---
+${PLAN_CONTENT}
+---
+
+Re-review it — check whether your prior findings are addressed and flag anything new. End with VERDICT: APPROVED or VERDICT: REVISE."
+
+jq --arg msg "$FOLLOW_UP" \
+   '. + [{"role":"user","content":$msg}]' "$SESSION_FILE" > /tmp/session-tmp.json \
+  && mv /tmp/session-tmp.json "$SESSION_FILE"
+
+curl -sf "$OLLAMA_HOST/api/chat" \
+  -H 'Content-Type: application/json' \
+  -d "$(jq -n --arg model "$OLLAMA_MODEL" --argjson msgs "$(cat $SESSION_FILE)" \
+       '{model:$model,messages:$msgs,stream:false}')" \
+  | jq -r '.message.content' > /tmp/ollama-verdict.txt
+
+jq --arg reply "$(cat /tmp/ollama-verdict.txt)" \
+   '. + [{"role":"assistant","content":$reply}]' "$SESSION_FILE" > /tmp/session-tmp.json \
+  && mv /tmp/session-tmp.json "$SESSION_FILE"
 ```
 
 ### Each round
-1. Read verdict file; append `## Round <n> — Codex` + critique to `LOG_FILE`.
+1. Read verdict file; append `## Round <n> — Ollama` + critique to `LOG_FILE`.
 2. Last line verdict: `APPROVED` → Resolution (converged); `REVISE` → Claude decides what's worth acting on (final arbiter), revise `PLAN_FILE`, append `### Claude's response` (what changed/rejected + why), increment.
 3. round > `MAX_ROUNDS` → Resolution (deadlock).
 
@@ -184,8 +236,10 @@ codex exec resume "$THREAD_ID" -c sandbox_mode="read-only" --json \
 
 ## Hard rules
 - Act 1 precedes Act 2. `CONTEXT.md` stays a glossary only — no implementation details.
-- Codex read-only EVERY round (`-s read-only` first, `-c sandbox_mode="read-only"` on resume — resume has no `-s`). Never writes.
+- The ollama model never touches files — it only sees what's passed in the prompt.
 - Loop ALWAYS terminates at `MAX_ROUNDS`. Claude is final arbiter on REVISE (reject with logged reason). Code only after sign-off. `LOG_FILE` is the deliverable.
+- `SESSION_FILE` accumulates the full conversation; don't delete it mid-loop or history is lost.
 
 ## What NOT to do
-- Don't review already-written code (`/codex:review`). Don't pin `-codex` variants on ChatGPT auth. Don't let Codex edit files. Don't skip Act 1.
+- Don't review already-written code. Don't skip Act 1.
+- Don't pass secrets or credentials into the plan text — ollama may be on a shared host.
